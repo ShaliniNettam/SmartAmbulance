@@ -1,3 +1,8 @@
+from pymongo.errors import DuplicateKeyError
+from db import hospital_events, hospital_checkpoints
+from datetime import datetime, timezone
+from pymongo.errors import DuplicateKeyError
+
 # ============================================================
 # SMART AMBULANCE - HOSPITAL BACKEND
 # Event Verification + Decryption + Ledger Verification
@@ -31,22 +36,6 @@ KEYS_DIR = BASE_DIR / "keys"
 HOSPITAL_PRIVATE_KEY_PATH = KEYS_DIR / "hospital_private.pem"
 AMBULANCE_PUBLIC_KEY_PATH = KEYS_DIR / "ambulance_signing_public.pem"
 
-AMBULANCE_LEDGER_PATH = (
-    BASE_DIR.parent
-    / "AMBULANCE"
-    / "data"
-    / "ledger"
-    / "ledger.json"
-)
-
-AMBULANCE_CHECKPOINT_PATH = (
-    BASE_DIR.parent
-    / "AMBULANCE"
-    / "data"
-    / "ledger"
-    / "checkpoint.json"
-)
-
 
 # ============================================================
 # CREATE API
@@ -73,11 +62,12 @@ class AmbulanceEvent(BaseModel):
     wrapped_aes_key: str
     sha256: str
     signature: str
+    ledger_blocks: list[dict[str, Any]]
+    checkpoint: dict[str, Any]
 
 
 class LedgerVerificationRequest(BaseModel):
     blocks: list[dict[str, Any]]
-
 
 # ============================================================
 # ROOT
@@ -279,50 +269,31 @@ def verify_ledger_blocks(blocks: list[dict[str, Any]]):
 def verify_checkpoint_and_event(
     event_id: str,
     event_sha256: str,
+    blocks: list[dict[str, Any]],
+    checkpoint: dict[str, Any],
 ) -> dict[str, bool]:
 
-    if not AMBULANCE_LEDGER_PATH.is_file():
-        raise HTTPException(
-            status_code=404,
-            detail="Ambulance ledger file not found.",
-        )
-
-    if not AMBULANCE_CHECKPOINT_PATH.is_file():
-        raise HTTPException(
-            status_code=404,
-            detail="Ambulance checkpoint file not found.",
-        )
-
-    # Load the ledger and checkpoint.
-    try:
-        with open(
-            AMBULANCE_LEDGER_PATH,
-            "r",
-            encoding="utf-8",
-        ) as file:
-            blocks = json.load(file)
-
-        with open(
-            AMBULANCE_CHECKPOINT_PATH,
-            "r",
-            encoding="utf-8",
-        ) as file:
-            checkpoint = json.load(file)
-
-    except (OSError, json.JSONDecodeError) as exc:
-        raise HTTPException(
-            status_code=500,
-            detail="Could not read the ledger or checkpoint JSON.",
-        ) from exc
-
+    # Validate the received checkpoint.
     if not isinstance(checkpoint, dict):
         raise HTTPException(
             status_code=400,
             detail="Invalid checkpoint format.",
         )
 
-    # Verify the entire ledger first.
+    # Verify the entire ledger received from the ambulance.
     ledger_result = verify_ledger_blocks(blocks)
+
+    if not ledger_result.get("ledger_valid"):
+        raise HTTPException(
+            status_code=400,
+            detail="Ambulance ledger verification failed.",
+        )
+
+    if not blocks:
+        raise HTTPException(
+            status_code=400,
+            detail="The received ledger is empty.",
+        )
 
     # Read the checkpoint signature.
     signature_hex = checkpoint.get("signature")
@@ -333,7 +304,7 @@ def verify_checkpoint_and_event(
             detail="Checkpoint signature is missing.",
         )
 
-    # Verify the checkpoint signature using the ambulance public key.
+    # Verify the checkpoint signature using the trusted ambulance public key.
     try:
         checkpoint_signature = bytes.fromhex(signature_hex)
 
@@ -349,10 +320,7 @@ def verify_checkpoint_and_event(
             separators=(",", ":"),
         ).encode("utf-8")
 
-        with open(
-            AMBULANCE_PUBLIC_KEY_PATH,
-            "rb",
-        ) as file:
+        with open(AMBULANCE_PUBLIC_KEY_PATH, "rb") as file:
             public_key = serialization.load_pem_public_key(
                 file.read()
             )
@@ -384,7 +352,7 @@ def verify_checkpoint_and_event(
             detail="Checkpoint signature or format is invalid.",
         ) from exc
 
-    # Ensure the signed checkpoint matches the saved ledger.
+    # Confirm that the signed checkpoint matches the received ledger.
     latest_block = blocks[-1]
 
     if (
@@ -394,14 +362,14 @@ def verify_checkpoint_and_event(
     ):
         raise HTTPException(
             status_code=400,
-            detail="Checkpoint does not match the current ledger.",
+            detail="Checkpoint does not match the received ledger.",
         )
 
-    # Find the event in the ledger.
+    # Find the event in the received ledger.
     matching_blocks = [
         block
         for block in blocks
-        if block["event_id"] == event_id
+        if block.get("event_id") == event_id
     ]
 
     if len(matching_blocks) != 1:
@@ -413,10 +381,15 @@ def verify_checkpoint_and_event(
             ),
         )
 
-    # Confirm the submitted event hash matches its ledger entry.
-    if not hmac.compare_digest(
-        matching_blocks[0]["ciphertext_sha256"],
-        event_sha256,
+    # Compare the encrypted event's hash with its ledger entry.
+    ledger_event_hash = matching_blocks[0].get("ciphertext_sha256")
+
+    if (
+        not isinstance(ledger_event_hash, str)
+        or not hmac.compare_digest(
+            ledger_event_hash,
+            event_sha256,
+        )
     ):
         raise HTTPException(
             status_code=400,
@@ -425,9 +398,142 @@ def verify_checkpoint_and_event(
 
     return {
         "checkpoint_verified": True,
-        "ledger_verified": ledger_result["ledger_valid"],
+        "ledger_verified": True,
         "event_ledger_verified": True,
     }
+
+def validate_checkpoint_freshness(
+    ambulance_id: str,
+    checkpoint: dict,
+) -> dict:
+    """Reject stale checkpoints and conflicting hashes at the same height."""
+
+    try:
+        block_count = int(checkpoint["block_count"])
+        latest_index = int(checkpoint["latest_index"])
+        latest_hash = checkpoint["latest_hash"]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Checkpoint metadata is invalid.",
+        ) from exc
+
+    if (
+        block_count < 1
+        or latest_index != block_count - 1
+        or not isinstance(latest_hash, str)
+        or len(latest_hash) != 64
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Checkpoint metadata is inconsistent.",
+        )
+
+    stored = hospital_checkpoints.find_one(
+        {"ambulance_id": ambulance_id}
+    )
+
+    if stored is None:
+        # First verified checkpoint establishes the baseline.
+        return {
+            "ambulance_id": ambulance_id,
+            "block_count": block_count,
+            "latest_index": latest_index,
+            "latest_hash": latest_hash,
+        }
+
+    stored_count = stored["block_count"]
+    stored_hash = stored["latest_hash"]
+
+    if block_count < stored_count:
+        raise HTTPException(
+            status_code=409,
+            detail="Rollback rejected: checkpoint is older than the accepted checkpoint.",
+        )
+
+    if block_count == stored_count and not hmac.compare_digest(
+        latest_hash, stored_hash
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Checkpoint conflict: different ledger hash at the same height.",
+        )
+
+    return {
+        "ambulance_id": ambulance_id,
+        "block_count": block_count,
+        "latest_index": latest_index,
+        "latest_hash": latest_hash,
+    }
+
+
+def save_accepted_checkpoint(checkpoint_record: dict) -> None:
+    """Save checkpoint metadata after a verified event is stored."""
+
+    ambulance_id = checkpoint_record["ambulance_id"]
+    block_count = checkpoint_record["block_count"]
+    latest_hash = checkpoint_record["latest_hash"]
+
+    stored = hospital_checkpoints.find_one(
+        {"ambulance_id": ambulance_id}
+    )
+
+    if stored is None:
+        try:
+            hospital_checkpoints.insert_one({
+                **checkpoint_record,
+                "accepted_at": datetime.now(timezone.utc),
+            })
+            return
+        except DuplicateKeyError:
+            # Another request may have created the baseline concurrently.
+            stored = hospital_checkpoints.find_one(
+                {"ambulance_id": ambulance_id}
+            )
+
+    if stored is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not read the accepted checkpoint.",
+        )
+
+    stored_count = stored["block_count"]
+
+    if block_count < stored_count:
+        raise HTTPException(
+            status_code=409,
+            detail="Checkpoint became stale while processing the event.",
+        )
+
+    if block_count == stored_count:
+        if not hmac.compare_digest(
+            latest_hash, stored["latest_hash"]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Checkpoint conflict detected while saving.",
+            )
+        return
+
+    result = hospital_checkpoints.update_one(
+        {
+            "_id": stored["_id"],
+            "block_count": stored_count,
+            "latest_hash": stored["latest_hash"],
+        },
+        {
+            "$set": {
+                **checkpoint_record,
+                "accepted_at": datetime.now(timezone.utc),
+            }
+        },
+    )
+
+    if result.modified_count != 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Checkpoint changed concurrently. Retry the request.",
+        )
 
 
 # ============================================================
@@ -435,7 +541,7 @@ def verify_checkpoint_and_event(
 # ============================================================
 
 @app.post("/receive-event")
-def receive_event(event: AmbulanceEvent):
+def receive_event(  event: AmbulanceEvent):
 
     # Decode incoming base64 data.
     try:
@@ -524,6 +630,8 @@ def receive_event(event: AmbulanceEvent):
     checkpoint_status = verify_checkpoint_and_event(
         event.event_id,
         event.sha256,
+        event.ledger_blocks,
+        event.checkpoint,
     )
 
     # Recover AES key using the hospital private key.
@@ -580,6 +688,61 @@ def receive_event(event: AmbulanceEvent):
             detail="Event ID does not match decrypted event.",
         )
 
+    ambulance_ids = {
+        block.get("ambulance_id")
+        for block in event.ledger_blocks
+    }
+
+    if len(ambulance_ids) != 1 or None in ambulance_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="Ledger contains inconsistent ambulance IDs.",
+        )
+
+    ambulance_id = next(iter(ambulance_ids))
+
+    checkpoint_record = validate_checkpoint_freshness(
+        ambulance_id,
+        event.checkpoint,
+    )
+
+    # Store the verified event in MongoDB.
+    hospital_record = {
+        "event_id": event.event_id,
+        "event_sha256": event.sha256,
+        "decrypted_event": decrypted_event,
+        "hash_verified": True,
+        "signature_verified": True,
+        "checkpoint_verified": checkpoint_status["checkpoint_verified"],
+        "ledger_verified": checkpoint_status["ledger_verified"],
+        "event_ledger_verified": checkpoint_status[
+            "event_ledger_verified"
+        ],
+    }
+
+    try:
+        # Save the verified event.
+        hospital_events.insert_one(hospital_record)
+
+        # Save or advance the hospital's accepted checkpoint.
+        save_accepted_checkpoint(checkpoint_record)
+
+    except DuplicateKeyError:
+        raise HTTPException(
+            status_code=409,
+            detail="This event has already been stored.",
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Verified event or checkpoint could not be saved.",
+        ) from exc
+
+
     return {
         "status": "success",
         "message": (
@@ -611,216 +774,319 @@ def verify_ledger(request: LedgerVerificationRequest):
     return verify_ledger_blocks(request.blocks)
 
 
+# # ============================================================
+# # VERIFY THE ACTUAL AMBULANCE ledger.json FILE
+# # GET /verify-local-ledger
+# # ============================================================
+
+# @app.get("/verify-local-ledger")
+# def verify_local_ledger():
+
+#     if not AMBULANCE_LEDGER_PATH.is_file():
+#         raise HTTPException(
+#             status_code=404,
+#             detail=(
+#                 "Ambulance ledger file not found at: "
+#                 f"{AMBULANCE_LEDGER_PATH}"
+#             ),
+#         )
+
+#     try:
+#         with open(
+#             AMBULANCE_LEDGER_PATH,
+#             "r",
+#             encoding="utf-8",
+#         ) as file:
+#             blocks = json.load(file)
+
+#     except json.JSONDecodeError as exc:
+#         raise HTTPException(
+#             status_code=400,
+#             detail="Ambulance ledger.json contains invalid JSON.",
+#         ) from exc
+
+#     except OSError as exc:
+#         raise HTTPException(
+#             status_code=500,
+#             detail="Could not read the ambulance ledger file.",
+#         ) from exc
+
+#     result = verify_ledger_blocks(blocks)
+#     result["ledger_source"] = str(AMBULANCE_LEDGER_PATH)
+
+#     return result
+
+
+
+
 # ============================================================
-# VERIFY THE ACTUAL AMBULANCE ledger.json FILE
-# GET /verify-local-ledger
+# VERIFY LEDGER PROVIDED BY THE REQUEST
+# POST /verify-local-ledger
 # ============================================================
 
-@app.get("/verify-local-ledger")
-def verify_local_ledger():
+@app.post("/verify-local-ledger")
+def verify_local_ledger(request: LedgerVerificationRequest):
+    """Verify supplied ledger blocks without reading ambulance files."""
+    return verify_ledger_blocks(request.blocks)
 
-    if not AMBULANCE_LEDGER_PATH.is_file():
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                "Ambulance ledger file not found at: "
-                f"{AMBULANCE_LEDGER_PATH}"
-            ),
-        )
 
-    try:
-        with open(
-            AMBULANCE_LEDGER_PATH,
-            "r",
-            encoding="utf-8",
-        ) as file:
-            blocks = json.load(file)
 
-    except json.JSONDecodeError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="Ambulance ledger.json contains invalid JSON.",
-        ) from exc
 
-    except OSError as exc:
-        raise HTTPException(
-            status_code=500,
-            detail="Could not read the ambulance ledger file.",
-        ) from exc
+# # ============================================================
+# # VERIFY CHECKPOINT WITHOUT RECEIVING AN EVENT
+# # GET /verify-checkpoint
+# # ============================================================
 
-    result = verify_ledger_blocks(blocks)
-    result["ledger_source"] = str(AMBULANCE_LEDGER_PATH)
+# @app.get("/verify-checkpoint")
+# def verify_checkpoint():
 
-    return result
+#     if not AMBULANCE_LEDGER_PATH.is_file():
+#         raise HTTPException(
+#             status_code=404,
+#             detail="Ambulance ledger file not found.",
+#         )
+
+#     if not AMBULANCE_CHECKPOINT_PATH.is_file():
+#         raise HTTPException(
+#             status_code=404,
+#             detail="Ambulance checkpoint file not found.",
+#         )
+
+#     try:
+#         with open(
+#             AMBULANCE_LEDGER_PATH,
+#             "r",
+#             encoding="utf-8",
+#         ) as file:
+#             blocks = json.load(file)
+
+#         with open(
+#             AMBULANCE_CHECKPOINT_PATH,
+#             "r",
+#             encoding="utf-8",
+#         ) as file:
+#             checkpoint = json.load(file)
+
+#     except (OSError, json.JSONDecodeError) as exc:
+#         raise HTTPException(
+#             status_code=500,
+#             detail="Could not read the ledger or checkpoint JSON.",
+#         ) from exc
+
+#     if not isinstance(checkpoint, dict):
+#         raise HTTPException(
+#             status_code=400,
+#             detail="Invalid checkpoint format.",
+#         )
+
+#     ledger_result = verify_ledger_blocks(blocks)
+
+#     signature_hex = checkpoint.get("signature")
+
+#     if not isinstance(signature_hex, str):
+#         raise HTTPException(
+#             status_code=400,
+#             detail="Checkpoint signature is missing.",
+#         )
+
+#     try:
+#         checkpoint_signature = bytes.fromhex(signature_hex)
+
+#         signed_data = {
+#             key: value
+#             for key, value in checkpoint.items()
+#             if key != "signature"
+#         }
+
+#         canonical_data = json.dumps(
+#             signed_data,
+#             sort_keys=True,
+#             separators=(",", ":"),
+#         ).encode("utf-8")
+
+#         with open(
+#             AMBULANCE_PUBLIC_KEY_PATH,
+#             "rb",
+#         ) as file:
+#             public_key = serialization.load_pem_public_key(
+#                 file.read()
+#             )
+
+#         if not isinstance(public_key, rsa.RSAPublicKey):
+#             raise ValueError(
+#                 "Ambulance signing public key must be RSA."
+#             )
+
+#         public_key.verify(
+#             checkpoint_signature,
+#             canonical_data,
+#             padding.PSS(
+#                 mgf=padding.MGF1(hashes.SHA256()),
+#                 salt_length=padding.PSS.MAX_LENGTH,
+#             ),
+#             hashes.SHA256(),
+#         )
+
+#     except InvalidSignature as exc:
+#         raise HTTPException(
+#             status_code=401,
+#             detail="Checkpoint digital signature verification failed.",
+#         ) from exc
+
+#     except (ValueError, TypeError, OSError) as exc:
+#         raise HTTPException(
+#             status_code=400,
+#             detail="Checkpoint signature or format is invalid.",
+#         ) from exc
+
+#     latest_block = blocks[-1]
+
+#     if (
+#         checkpoint.get("block_count") != len(blocks)
+#         or checkpoint.get("latest_index") != latest_block["index"]
+#         or checkpoint.get("latest_hash") != latest_block["block_hash"]
+#     ):
+#         raise HTTPException(
+#             status_code=400,
+#             detail="Checkpoint does not match the current ledger.",
+#         )
+
+#     return {
+#         "status": "success",
+#         "message": "Checkpoint signature and ledger match verified.",
+#         "checkpoint_verified": True,
+#         "ledger_verified": ledger_result["ledger_valid"],
+#         "block_count": checkpoint["block_count"],
+#         "latest_index": checkpoint["latest_index"],
+#         "latest_hash": checkpoint["latest_hash"],
+#     }
+
+
 
 
 # ============================================================
-# VERIFY CHECKPOINT WITHOUT RECEIVING AN EVENT
-# GET /verify-checkpoint
+# VERIFY CHECKPOINT PROVIDED BY THE REQUEST
+# POST /verify-checkpoint
 # ============================================================
 
-@app.get("/verify-checkpoint")
-def verify_checkpoint():
+class CheckpointVerificationRequest(BaseModel):
+    blocks: list[dict[str, Any]]
+    checkpoint: dict[str, Any]
 
-    if not AMBULANCE_LEDGER_PATH.is_file():
-        raise HTTPException(
-            status_code=404,
-            detail="Ambulance ledger file not found.",
-        )
 
-    if not AMBULANCE_CHECKPOINT_PATH.is_file():
-        raise HTTPException(
-            status_code=404,
-            detail="Ambulance checkpoint file not found.",
-        )
+@app.post("/verify-checkpoint")
+def verify_checkpoint(request: CheckpointVerificationRequest):
 
-    try:
-        with open(
-            AMBULANCE_LEDGER_PATH,
-            "r",
-            encoding="utf-8",
-        ) as file:
-            blocks = json.load(file)
-
-        with open(
-            AMBULANCE_CHECKPOINT_PATH,
-            "r",
-            encoding="utf-8",
-        ) as file:
-            checkpoint = json.load(file)
-
-    except (OSError, json.JSONDecodeError) as exc:
-        raise HTTPException(
-            status_code=500,
-            detail="Could not read the ledger or checkpoint JSON.",
-        ) from exc
-
-    if not isinstance(checkpoint, dict):
+    if not request.blocks:
         raise HTTPException(
             status_code=400,
-            detail="Invalid checkpoint format.",
+            detail="Ledger is empty.",
         )
+    # Verify the supplied checkpoint against the supplied ledger.
 
-    ledger_result = verify_ledger_blocks(blocks)
+    
+    result = verify_checkpoint_and_event(
+        event_id=request.blocks[-1]["event_id"],
+        event_sha256=request.blocks[-1]["ciphertext_sha256"],
+        blocks=request.blocks,
+        checkpoint=request.checkpoint,
+    )
 
-    signature_hex = checkpoint.get("signature")
-
-    if not isinstance(signature_hex, str):
-        raise HTTPException(
-            status_code=400,
-            detail="Checkpoint signature is missing.",
-        )
-
-    try:
-        checkpoint_signature = bytes.fromhex(signature_hex)
-
-        signed_data = {
-            key: value
-            for key, value in checkpoint.items()
-            if key != "signature"
-        }
-
-        canonical_data = json.dumps(
-            signed_data,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-
-        with open(
-            AMBULANCE_PUBLIC_KEY_PATH,
-            "rb",
-        ) as file:
-            public_key = serialization.load_pem_public_key(
-                file.read()
-            )
-
-        if not isinstance(public_key, rsa.RSAPublicKey):
-            raise ValueError(
-                "Ambulance signing public key must be RSA."
-            )
-
-        public_key.verify(
-            checkpoint_signature,
-            canonical_data,
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH,
-            ),
-            hashes.SHA256(),
-        )
-
-    except InvalidSignature as exc:
-        raise HTTPException(
-            status_code=401,
-            detail="Checkpoint digital signature verification failed.",
-        ) from exc
-
-    except (ValueError, TypeError, OSError) as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="Checkpoint signature or format is invalid.",
-        ) from exc
-
-    latest_block = blocks[-1]
-
-    if (
-        checkpoint.get("block_count") != len(blocks)
-        or checkpoint.get("latest_index") != latest_block["index"]
-        or checkpoint.get("latest_hash") != latest_block["block_hash"]
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="Checkpoint does not match the current ledger.",
-        )
+    latest_block = request.blocks[-1]
 
     return {
         "status": "success",
-        "message": "Checkpoint signature and ledger match verified.",
-        "checkpoint_verified": True,
-        "ledger_verified": ledger_result["ledger_valid"],
-        "block_count": checkpoint["block_count"],
-        "latest_index": checkpoint["latest_index"],
-        "latest_hash": checkpoint["latest_hash"],
+        "message": "Supplied checkpoint signature and ledger verified.",
+        **result,
+        "block_count": len(request.blocks),
+        "latest_index": latest_block["index"],
+        "latest_hash": latest_block["block_hash"],
     }
+
+
+
+
+
+# # ============================================================
+# # LEDGER TAMPERING TEST
+# # Tests a modified copy without changing the real ledger
+# # GET /test-ledger-tampering
+# # ============================================================
+
+# @app.get("/test-ledger-tampering")
+# def test_ledger_tampering():
+
+#     if not AMBULANCE_LEDGER_PATH.is_file():
+#         raise HTTPException(
+#             status_code=404,
+#             detail="Ambulance ledger file not found.",
+#         )
+
+#     try:
+#         with open(
+#             AMBULANCE_LEDGER_PATH,
+#             "r",
+#             encoding="utf-8",
+#         ) as file:
+#             original_blocks = json.load(file)
+
+#     except (OSError, json.JSONDecodeError) as exc:
+#         raise HTTPException(
+#             status_code=500,
+#             detail="Could not read the ambulance ledger.",
+#         ) from exc
+
+#     if not original_blocks:
+#         raise HTTPException(
+#             status_code=400,
+#             detail="Ledger is empty.",
+#         )
+
+#     # Change a copy in memory only.
+#     tampered_blocks = deepcopy(original_blocks)
+#     tampered_blocks[0]["event_id"] += "-TAMPERED"
+
+#     try:
+#         verify_ledger_blocks(tampered_blocks)
+
+#     except HTTPException as exc:
+#         if exc.status_code == 400:
+#             return {
+#                 "status": "success",
+#                 "tamper_detected": True,
+#                 "message": "SUCCESS: Hospital detected the tampered ledger.",
+#                 "real_ledger_modified": False,
+#                 "details": exc.detail,
+#             }
+#         raise
+
+#     return {
+#         "status": "failed",
+#         "tamper_detected": False,
+#         "message": "WARNING: Tampering was not detected.",
+#         "real_ledger_modified": False,
+#     }
+
 
 
 # ============================================================
 # LEDGER TAMPERING TEST
-# Tests a modified copy without changing the real ledger
-# GET /test-ledger-tampering
+# Tests supplied blocks without accessing ambulance files
+# POST /test-ledger-tampering
 # ============================================================
 
-@app.get("/test-ledger-tampering")
-def test_ledger_tampering():
+@app.post("/test-ledger-tampering")
+def test_ledger_tampering(request: LedgerVerificationRequest):
+    # Keep the original data unchanged.
+    tampered_blocks = deepcopy(request.blocks)
 
-    if not AMBULANCE_LEDGER_PATH.is_file():
-        raise HTTPException(
-            status_code=404,
-            detail="Ambulance ledger file not found.",
-        )
-
-    try:
-        with open(
-            AMBULANCE_LEDGER_PATH,
-            "r",
-            encoding="utf-8",
-        ) as file:
-            original_blocks = json.load(file)
-
-    except (OSError, json.JSONDecodeError) as exc:
-        raise HTTPException(
-            status_code=500,
-            detail="Could not read the ambulance ledger.",
-        ) from exc
-
-    if not original_blocks:
+    if not tampered_blocks:
         raise HTTPException(
             status_code=400,
             detail="Ledger is empty.",
         )
 
-    # Change a copy in memory only.
-    tampered_blocks = deepcopy(original_blocks)
+    # Modify a copy so verification should reject it.
     tampered_blocks[0]["event_id"] += "-TAMPERED"
 
     try:
@@ -831,8 +1097,8 @@ def test_ledger_tampering():
             return {
                 "status": "success",
                 "tamper_detected": True,
-                "message": "SUCCESS: Hospital detected the tampered ledger.",
-                "real_ledger_modified": False,
+                "message": "Hospital detected the tampered ledger.",
+                "original_request_modified": False,
                 "details": exc.detail,
             }
         raise
@@ -840,72 +1106,139 @@ def test_ledger_tampering():
     return {
         "status": "failed",
         "tamper_detected": False,
-        "message": "WARNING: Tampering was not detected.",
-        "real_ledger_modified": False,
+        "message": "Tampering was not detected.",
+        "original_request_modified": False,
     }
+
+
+
+
+# # ============================================================
+# # SIGNATURE TAMPERING TEST
+# # Tests a modified event copy without changing the real event
+# # GET /test-signature-tampering
+# # ============================================================
+
+# @app.get("/test-signature-tampering")
+# def test_signature_tampering():
+
+#     events_dir = (
+#         AMBULANCE_LEDGER_PATH.parent.parent
+#         / "encrypted_events"
+#     )
+
+#     if not events_dir.is_dir():
+#         raise HTTPException(
+#             status_code=404,
+#             detail="Encrypted events directory not found.",
+#         )
+
+#     event_files = sorted(
+#         events_dir.glob("EVENT-*.json"),
+#         key=lambda path: path.stat().st_mtime,
+#         reverse=True,
+#     )
+
+#     if not event_files:
+#         raise HTTPException(
+#             status_code=404,
+#             detail="No encrypted event files found.",
+#         )
+
+#     try:
+#         with open(
+#             event_files[0],
+#             "r",
+#             encoding="utf-8",
+#         ) as file:
+#             original_data = json.load(file)
+
+#         test_data = deepcopy(original_data)
+
+#         signature = bytearray(
+#             base64.b64decode(
+#                 test_data["signature"],
+#                 validate=True,
+#             )
+#         )
+
+#         if not signature:
+#             raise ValueError("Event signature is empty.")
+
+#         signature[0] ^= 1
+
+#         test_data["signature"] = base64.b64encode(
+#             bytes(signature)
+#         ).decode("ascii")
+
+#     except (OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
+#         raise HTTPException(
+#             status_code=500,
+#             detail="Could not prepare the signature tampering test.",
+#         ) from exc
+
+#     try:
+#         receive_event(AmbulanceEvent(**test_data))
+
+#     except HTTPException as exc:
+#         if exc.status_code == 401:
+#             return {
+#                 "status": "success",
+#                 "tamper_detected": True,
+#                 "message": (
+#                     "SUCCESS: Hospital rejected the tampered "
+#                     "digital signature."
+#                 ),
+#                 "real_event_modified": False,
+#             }
+
+#         return {
+#             "status": "test_failed",
+#             "tamper_detected": False,
+#             "http_status": exc.status_code,
+#             "details": str(exc.detail),
+#             "real_event_modified": False,
+#         }
+
+#     return {
+#         "status": "test_failed",
+#         "tamper_detected": False,
+#         "message": "The tampered signature was not rejected.",
+#         "real_event_modified": False,
+#     }
+
 
 
 # ============================================================
 # SIGNATURE TAMPERING TEST
-# Tests a modified event copy without changing the real event
-# GET /test-signature-tampering
+# Tests a supplied event without accessing ambulance files
+# POST /test-signature-tampering
 # ============================================================
 
-@app.get("/test-signature-tampering")
-def test_signature_tampering():
-
-    events_dir = (
-        AMBULANCE_LEDGER_PATH.parent.parent
-        / "encrypted_events"
-    )
-
-    if not events_dir.is_dir():
-        raise HTTPException(
-            status_code=404,
-            detail="Encrypted events directory not found.",
-        )
-
-    event_files = sorted(
-        events_dir.glob("EVENT-*.json"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-
-    if not event_files:
-        raise HTTPException(
-            status_code=404,
-            detail="No encrypted event files found.",
-        )
+@app.post("/test-signature-tampering")
+def test_signature_tampering(event: AmbulanceEvent):
+    # Copy the submitted event; do not modify the original request.
+    test_data = event.model_dump()
+    signature_text = test_data.get("signature", "")
 
     try:
-        with open(
-            event_files[0],
-            "r",
-            encoding="utf-8",
-        ) as file:
-            original_data = json.load(file)
-
-        test_data = deepcopy(original_data)
-
         signature = bytearray(
-            base64.b64decode(
-                test_data["signature"],
-                validate=True,
-            )
+            base64.b64decode(signature_text, validate=True)
         )
 
         if not signature:
             raise ValueError("Event signature is empty.")
 
+        # Corrupt one byte of the signature.
         signature[0] ^= 1
 
         test_data["signature"] = base64.b64encode(
             bytes(signature)
         ).decode("ascii")
 
-    except (OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
+    except (ValueError, TypeError) as exc:
         raise HTTPException(
-            status_code=500,
+            status_code=400,
             detail="Could not prepare the signature tampering test.",
         ) from exc
 
@@ -917,11 +1250,8 @@ def test_signature_tampering():
             return {
                 "status": "success",
                 "tamper_detected": True,
-                "message": (
-                    "SUCCESS: Hospital rejected the tampered "
-                    "digital signature."
-                ),
-                "real_event_modified": False,
+                "message": "Hospital rejected the tampered digital signature.",
+                "original_request_modified": False,
             }
 
         return {
@@ -929,12 +1259,12 @@ def test_signature_tampering():
             "tamper_detected": False,
             "http_status": exc.status_code,
             "details": str(exc.detail),
-            "real_event_modified": False,
+            "original_request_modified": False,
         }
 
     return {
         "status": "test_failed",
         "tamper_detected": False,
         "message": "The tampered signature was not rejected.",
-        "real_event_modified": False,
+        "original_request_modified": False,
     }

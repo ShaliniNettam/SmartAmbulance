@@ -1,13 +1,28 @@
+# Environment variables and secrets
 .env
 .env.*
 !.env.example
+
+# Python
 __pycache__/
+*.py[cod]
 .venv/
 venv/
+
+# Ambulance sensitive data
 AMBULANCE/data/keys/
 AMBULANCE/data/encrypted_events/
 AMBULANCE/data/ledger/
+
+# Hospital private keys
 HOSPITAL_BACKEND/keys/
 *.pem
-# Local dataset files
+
+# Local dataset
 AMBULANCE/mimic-iv-clinical-database-demo-2.2/
+
+# IDE and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

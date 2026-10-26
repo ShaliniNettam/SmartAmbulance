@@ -37,6 +37,7 @@ app = FastAPI(
 # ============================================================
 
 LEDGER_PATH = os.path.join("data", "ledger", "ledger.json")
+CHECKPOINT_PATH = os.path.join("data", "ledger", "checkpoint.json")
 ENCRYPTED_EVENTS_DIR = os.path.join("data", "encrypted_events")
 
 os.makedirs(ENCRYPTED_EVENTS_DIR, exist_ok=True)
@@ -273,17 +274,28 @@ def predict(request: VitalSignsRequest):
             ),
         ) from exc
 
-    # Send the encrypted event to the hospital.
+    # Send the encrypted event and verification data to the hospital.
     try:
+        # Load the latest signed checkpoint.
+        with open(CHECKPOINT_PATH, "r", encoding="utf-8") as file:
+            checkpoint = json.load(file)
+
+        # Include the ledger and checkpoint with the encrypted event.
+        hospital_payload = {
+            **encrypted_event,
+            "ledger_blocks": ledger.chain,
+            "checkpoint": checkpoint,
+        }
+
         response = requests.post(
             HOSPITAL_RECEIVE_URL,
-            json=encrypted_event,
+            json=hospital_payload,
             timeout=HOSPITAL_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
         hospital_result = response.json()
 
-    except requests.RequestException as exc:
+    except (requests.RequestException, OSError, json.JSONDecodeError) as exc:
         print("HOSPITAL DELIVERY ERROR:", repr(exc))
         raise HTTPException(
             status_code=502,
@@ -296,7 +308,6 @@ def predict(request: VitalSignsRequest):
                 "event_id": event_id,
             },
         ) from exc
-
     # Return the prediction and hospital verification result.
     return {
         "event_id": event_id,
