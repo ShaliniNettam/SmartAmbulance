@@ -1,0 +1,22 @@
+{
+    "model_name": "Bi-LSTM + Attention",
+    "input_size": 6,
+    "hidden_size": 64,
+    "num_layers": 2,
+    "num_classes": 3,
+    "dropout": 0.3,
+    "sequence_length": 10,
+    "features": [
+        "Heart Rate",
+        "SpO2",
+        "Respiratory Rate",
+        "SBP",
+        "DBP",
+        "Temperature"
+    ],
+    "class_names": [
+        "Stable",
+        "Moderate Risk",
+        "Critical Risk"
+    ]
+}

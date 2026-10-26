@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+.venv/
+venv/
+AMBULANCE/data/keys/
+AMBULANCE/data/encrypted_events/
+AMBULANCE/data/ledger/
+HOSPITAL_BACKEND/keys/
+*.pem
+# Local dataset files
+AMBULANCE/mimic-iv-clinical-database-demo-2.2/

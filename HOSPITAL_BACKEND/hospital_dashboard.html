@@ -1,0 +1,199 @@
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Smart Ambulance | Hospital Dashboard</title>
+<style>
+* { box-sizing: border-box; }
+body {
+  margin: 0; font-family: Arial, sans-serif;
+  background: #f1f5f9; color: #172033;
+}
+header {
+  background: #102a43; color: white; padding: 22px 6%;
+}
+header h1 { margin: 0 0 8px; font-size: 26px; }
+header p { margin: 0; color: #cbd5e1; }
+main { max-width: 1050px; margin: 28px auto; padding: 0 18px; }
+.card {
+  background: white; border-radius: 12px; padding: 22px;
+  margin-bottom: 20px; box-shadow: 0 3px 12px #0000000c;
+}
+h2 { margin-top: 0; font-size: 19px; }
+input, button {
+  padding: 12px; font-size: 15px; border-radius: 7px;
+}
+input { border: 1px solid #cbd5e1; width: 100%; margin: 10px 0 14px; }
+button {
+  border: 0; background: #087f8c; color: white;
+  font-weight: bold; cursor: pointer;
+}
+button:hover { background: #066773; }
+.note { color: #64748b; font-size: 13px; line-height: 1.5; }
+#status { margin-top: 14px; font-weight: bold; white-space: pre-wrap; overflow-wrap: anywhere; }
+.grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+}
+.metric { background: #f1f5f9; padding: 16px; border-radius: 9px; }
+.metric span { display: block; color: #64748b; font-size: 13px; }
+.metric strong { display: block; font-size: 23px; margin-top: 8px; }
+#results { display: none; }
+#risk { display: inline-block; padding: 7px 12px; border-radius: 20px; }
+#details { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; }
+footer { text-align: center; padding: 20px; color: #64748b; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Smart Ambulance</h1>
+  <p>Hospital Monitoring &amp; Secure Patient Event Verification</p>
+</header>
+
+<main>
+  <section class="card">
+    <h2>Receive Ambulance Event</h2>
+    <p>Select an encrypted event JSON file from the ambulance project.</p>
+    <form id="eventForm">
+      <input id="eventFile" type="file" accept=".json,application/json" required>
+      <button type="submit">Verify &amp; Decrypt Event</button>
+    </form>
+    <p class="note">
+      The event is sent to your local hospital backend at port 8001.
+      Use test data only while developing.
+    </p>
+    <div id="status" role="status"></div>
+  </section>
+
+  <section class="card" id="results">
+    <h2>Patient Event Details</h2>
+    <p>Event ID: <strong id="eventId">—</strong></p>
+    <p>Predicted Risk: <strong id="risk">—</strong></p>
+    <div class="grid">
+      <div class="metric"><span>Heart Rate</span><strong id="hr">—</strong></div>
+      <div class="metric"><span>SpO₂</span><strong id="spo2">—</strong></div>
+      <div class="metric"><span>Respiratory Rate</span><strong id="rr">—</strong></div>
+      <div class="metric"><span>Systolic BP</span><strong id="sbp">—</strong></div>
+      <div class="metric"><span>Diastolic BP</span><strong id="dbp">—</strong></div>
+      <div class="metric"><span>Temperature</span><strong id="temp">—</strong></div>
+    </div>
+    <h2 style="margin-top:24px">Verification Results</h2>
+    <p id="verification">—</p>
+    <details>
+      <summary>View decrypted event details</summary>
+      <pre id="details"></pre>
+    </details>
+  </section>
+</main>
+<footer>Smart Ambulance Project · Local Development Dashboard</footer>
+
+<script>
+const form = document.getElementById("eventForm");
+const statusBox = document.getElementById("status");
+const results = document.getElementById("results");
+
+form.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  results.style.display = "none";
+
+  const file = document.getElementById("eventFile").files[0];
+  if (!file) {
+    statusBox.textContent = "Please select an event JSON file.";
+    return;
+  }
+
+  try {
+    statusBox.textContent = "Reading event file...";
+    const event = JSON.parse(await file.text());
+
+    for (const field of [
+      "event_id", "nonce", "ciphertext",
+      "wrapped_aes_key", "sha256", "signature"
+    ]) {
+      if (typeof event[field] !== "string" || !event[field]) {
+        throw new Error("Selected file is missing required field: " + field);
+      }
+    }
+
+    statusBox.textContent = "Sending event to hospital for verification...";
+
+    const response = await fetch("http://127.0.0.1:8001/receive-event", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        event_id: event.event_id,
+        nonce: event.nonce,
+        ciphertext: event.ciphertext,
+        wrapped_aes_key: event.wrapped_aes_key,
+        sha256: event.sha256,
+        signature: event.signature
+      })
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      const detail = data.detail;
+      throw new Error(
+        typeof detail === "string" ? detail :
+        detail ? JSON.stringify(detail) :
+        data.message || "Hospital backend rejected the event."
+      );
+    }
+
+    if (
+      data.status !== "success" ||
+      !data.decryption_successful ||
+      !data.hash_verified ||
+      !data.signature_verified ||
+      !data.decrypted_event
+    ) {
+      throw new Error(data.message || "Event verification or decryption failed.");
+    }
+
+    const patient = data.decrypted_event;
+    document.getElementById("eventId").textContent = patient.event_id || "—";
+
+    const risk = document.getElementById("risk");
+    risk.textContent = patient.risk || "Unknown";
+    risk.style.background =
+      patient.risk === "Critical Risk" ? "#fee2e2" :
+      patient.risk === "Moderate Risk" ? "#fef3c7" : "#dcfce7";
+    risk.style.color =
+      patient.risk === "Critical Risk" ? "#991b1b" :
+      patient.risk === "Moderate Risk" ? "#92400e" : "#166534";
+
+    const show = (id, value, unit = "") => {
+      document.getElementById(id).textContent =
+        value == null ? "—" : value + unit;
+    };
+
+    show("hr", patient.heart_rate, " bpm");
+    show("spo2", patient.spo2, "%");
+    show("rr", patient.respiratory_rate, " /min");
+    show("sbp", patient.sbp, " mmHg");
+    show("dbp", patient.dbp, " mmHg");
+    show("temp", patient.temperature, " °C");
+
+    document.getElementById("verification").textContent =
+      "PASS: Event hash verified. " +
+      "PASS: Ambulance digital signature verified (RSA-PSS-SHA256). " +
+      "PASS: AES-GCM decryption succeeded.";
+
+    document.getElementById("details").textContent =
+      JSON.stringify(patient, null, 2);
+
+    results.style.display = "block";
+    statusBox.textContent =
+      "SUCCESS: Event hash, digital signature, and decryption verified.";
+  } catch (error) {
+    statusBox.textContent = "ERROR: " +
+      (error instanceof Error ? error.message : String(error));
+  }
+});
+</script>
+</body>
+</html>
+```
