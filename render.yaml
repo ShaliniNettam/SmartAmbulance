@@ -1,0 +1,49 @@
+services:
+  - type: web
+    name: smart-ambulance-hospital
+    env: python
+    rootDir: HOSPITAL_BACKEND
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn hospital_api:app --host 0.0.0.0 --port $PORT
+    repo: .
+    branch: main
+    envVars:
+      - key: MONGODB_URI
+        sync: false
+      - key: HOSPITAL_PRIVATE_KEY
+        sync: false
+      - key: AMBULANCE_PUBLIC_KEY
+        sync: false
+      - key: LEDGER_DIR
+        value: /var/data
+        sync: false
+
+  - type: web
+    name: smart-ambulance-api
+    env: python
+    rootDir: AMBULANCE
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
+    repo: .
+    branch: main
+    envVars:
+      - key: HOSPITAL_API_URL
+        sync: false
+      - key: LEDGER_DIR
+        value: /var/data
+        sync: false
+
+  - type: web
+    name: smart-ambulance-sensor-receiver
+    env: python
+    rootDir: AMBULANCE
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn sensor_receiver:app --host 0.0.0.0 --port $PORT
+    repo: .
+    branch: main
+    envVars:
+      - key: AMBULANCE_API_URL
+        sync: false
+      - key: LEDGER_DIR
+        value: /var/data
+        sync: false
