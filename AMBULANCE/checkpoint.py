@@ -1,4 +1,5 @@
 
+import os
 import json
 from pathlib import Path
 
@@ -70,10 +71,17 @@ def get_block_hash(block):
 
 
 def load_private_key():
+    key_data = os.getenv("AMBULANCE_SIGNING_PRIVATE_KEY")
+
+    if key_data:
+        return serialization.load_pem_private_key(
+            key_data.replace("\\n", "\n").encode("utf-8"),
+            password=None,
+        )
+
     if not PRIVATE_KEY_PATH.exists():
         raise FileNotFoundError(
-            f"Signing private key not found: {PRIVATE_KEY_PATH}\n"
-            "Run: python generate_signing_keys.py"
+            f"Signing private key not found: {PRIVATE_KEY_PATH}"
         )
 
     return serialization.load_pem_private_key(
@@ -83,6 +91,13 @@ def load_private_key():
 
 
 def load_public_key():
+    key_data = os.getenv("AMBULANCE_SIGNING_PUBLIC_KEY")
+
+    if key_data:
+        return serialization.load_pem_public_key(
+            key_data.replace("\\n", "\n").encode("utf-8")
+        )
+
     if not PUBLIC_KEY_PATH.exists():
         raise FileNotFoundError(
             f"Signing public key not found: {PUBLIC_KEY_PATH}"
@@ -173,7 +188,6 @@ def verify_checkpoint():
 
     print("PASS: Checkpoint signature is valid.")
 
-    # Compare the signed checkpoint against the current saved ledger.
     try:
         blocks = load_ledger()
         latest_block = blocks[-1]
@@ -196,6 +210,7 @@ def verify_checkpoint():
 
     print("PASS: Checkpoint matches the current ledger's latest block.")
     return True
+
 
 if __name__ == "__main__":
     sign_checkpoint()
