@@ -111,6 +111,38 @@ def hospital_dashboard():
         )
 
     return FileResponse(dashboard_file)
+# ============================================================
+# AUTOMATIC VERIFIED PATIENT EVENT HISTORY
+# ============================================================
+
+@app.get("/dashboard/events")
+def get_dashboard_events():
+
+    try:
+        records = list(
+            hospital_events.find(
+                {
+                    "hash_verified": True,
+                    "signature_verified": True,
+                    "checkpoint_verified": True,
+                    "ledger_verified": True,
+                    "event_ledger_verified": True,
+                },
+                {"_id": 0}
+            ).sort("_id", -1).limit(100)
+        )
+
+        return {
+            "status": "success",
+            "count": len(records),
+            "events": records,
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to retrieve verified hospital events."
+        ) from exc
 
 
 # ============================================================

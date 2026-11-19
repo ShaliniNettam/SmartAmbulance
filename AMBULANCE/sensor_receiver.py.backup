@@ -1,0 +1,70 @@
+from datetime import datetime, timezone
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from typing import Optional
+
+app = FastAPI(
+    title="Smart Ambulance - Live Sensor Receiver",
+    description="Receives MAX30102 heart rate and SpO2 readings",
+    version="1.0.0"
+)
+
+
+class SensorReading(BaseModel):
+    heart_rate: float = Field(gt=0, le=250)
+    spo2: float = Field(gt=0, le=100)
+    device: str = "MAX30102"
+    timestamp: Optional[str] = None
+
+
+latest_reading = None
+reading_history = []
+
+
+@app.get("/")
+def root():
+    return {
+        "message": "MAX30102 Sensor Receiver is running",
+        "status": "active"
+    }
+
+
+@app.post("/sensor-data")
+def receive_sensor_data(reading: SensorReading):
+    global latest_reading
+
+    record = reading.model_dump()
+    record["received_at"] = datetime.now(timezone.utc).isoformat()
+
+    latest_reading = record
+    reading_history.append(record)
+
+    if len(reading_history) > 100:
+        reading_history.pop(0)
+
+    print("Received MAX30102 reading:", record)
+
+    return {
+        "status": "received",
+        "message": "Sensor reading received successfully",
+        "data": record
+    }
+
+
+@app.get("/latest")
+def get_latest_reading():
+    if latest_reading is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No sensor readings received yet"
+        )
+
+    return latest_reading
+
+
+@app.get("/history")
+def get_reading_history():
+    return {
+        "count": len(reading_history),
+        "readings": reading_history
+    }

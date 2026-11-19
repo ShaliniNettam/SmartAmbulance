@@ -327,3 +327,149 @@ def predict(request: VitalSignsRequest):
         "hospital_delivery": "success",
         "hospital_response": hospital_result,
     }
+
+# ============================================================
+# MAX30102 SENSOR EVENT - SECURE HOSPITAL DELIVERY
+# Does not modify or invoke the existing prediction model.
+# ============================================================
+
+class SensorEventRequest(BaseModel):
+    heart_rate: float
+    spo2: float
+    device: str = "MAX30102"
+    timestamp: str | None = None
+
+
+@app.post("/sensor-event")
+def create_sensor_event(request: SensorEventRequest):
+
+    if not 30 <= request.heart_rate <= 220:
+        raise HTTPException(
+            status_code=400,
+            detail="Heart rate is outside the accepted sensor range."
+        )
+
+    if not 70 <= request.spo2 <= 100:
+        raise HTTPException(
+            status_code=400,
+            detail="SpO2 is outside the accepted sensor range."
+        )
+
+    if not ledger.verify_chain():
+        raise HTTPException(
+            status_code=500,
+            detail="Ledger integrity verification failed."
+        )
+
+    event_id = f"SENSOR-{uuid.uuid4().hex}"
+
+    event = {
+        "event_id": event_id,
+        "event_type": "sensor_telemetry",
+        "patient_id": "P001",
+        "ambulance_id": "AMBULANCE-001",
+        "timestamp": time.time(),
+        "sensor_timestamp": request.timestamp,
+        "heart_rate": request.heart_rate,
+        "spo2": request.spo2,
+        "device": request.device,
+        "risk": None,
+        "prediction_status": "not_performed",
+        "model_version": "MAX30102-SENSOR-v1"
+    }
+
+    key = generate_key()
+    event_json = json.dumps(event)
+
+    nonce, ciphertext = encrypt_data(event_json, key)
+    wrapped_key = wrap_aes_key(key)
+
+    ciphertext_hash = calculate_sha256(nonce, ciphertext)
+
+    signature = base64.b64encode(
+        sign_event(nonce + ciphertext)
+    ).decode("utf-8")
+
+    encrypted_event = {
+        "event_id": event_id,
+        "encryption_algorithm": "AES-256-GCM",
+        "key_wrapping_algorithm": "RSA-OAEP-SHA256",
+        "signature_algorithm": "RSA-PSS-SHA256",
+        "nonce": base64.b64encode(nonce).decode("utf-8"),
+        "ciphertext": base64.b64encode(ciphertext).decode("utf-8"),
+        "wrapped_aes_key": base64.b64encode(wrapped_key).decode("utf-8"),
+        "sha256": ciphertext_hash,
+        "signature": signature
+    }
+
+    encrypted_event_path = os.path.join(
+        ENCRYPTED_EVENTS_DIR,
+        f"{event_id}.json"
+    )
+
+    try:
+        with open(encrypted_event_path, "x", encoding="utf-8") as file:
+            json.dump(encrypted_event, file, indent=4)
+            file.flush()
+            os.fsync(file.fileno())
+
+        ledger.add_block(
+            event_id=event_id,
+            ambulance_id=event["ambulance_id"],
+            model_version=event["model_version"],
+            ciphertext_sha256=ciphertext_hash
+        )
+
+        if not ledger.verify_chain():
+            raise RuntimeError("Ledger verification failed.")
+
+        sign_checkpoint()
+
+        if not verify_checkpoint():
+            raise RuntimeError("Checkpoint verification failed.")
+
+        with open(CHECKPOINT_PATH, "r", encoding="utf-8") as file:
+            checkpoint = json.load(file)
+
+        hospital_payload = {
+            **encrypted_event,
+            "ledger_blocks": ledger.chain,
+            "checkpoint": checkpoint
+        }
+
+        response = requests.post(
+            HOSPITAL_RECEIVE_URL,
+            json=hospital_payload,
+            timeout=HOSPITAL_TIMEOUT_SECONDS
+        )
+        response.raise_for_status()
+
+        hospital_result = response.json()
+
+    except Exception as exc:
+        print("SENSOR EVENT ERROR:", repr(exc))
+
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": (
+                    "Sensor event processing or hospital delivery failed. "
+                    "Check the saved event and ledger before retrying."
+                ),
+                "event_id": event_id
+            }
+        ) from exc
+
+    return {
+        "status": "success",
+        "event_id": event_id,
+        "event_type": "sensor_telemetry",
+        "prediction_performed": False,
+        "encryption": "AES-256-GCM",
+        "signature": "RSA-PSS-SHA256",
+        "ledger_valid": True,
+        "checkpoint_verified": True,
+        "hospital_delivery": "success",
+        "hospital_response": hospital_result
+    }
+
