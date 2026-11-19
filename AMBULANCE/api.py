@@ -1,5 +1,7 @@
+
 import requests
 from checkpoint import sign_checkpoint, verify_checkpoint
+
 # ============================================================
 # SMART AMBULANCE - FASTAPI BACKEND
 # AES-256-GCM + RSA-OAEP-SHA256 + DIGITAL SIGNATURE
@@ -8,7 +10,6 @@ from checkpoint import sign_checkpoint, verify_checkpoint
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from predict import predict_risk
 from crypto import (
     generate_key,
     encrypt_data,
@@ -42,14 +43,19 @@ ENCRYPTED_EVENTS_DIR = os.path.join("data", "encrypted_events")
 
 os.makedirs(ENCRYPTED_EVENTS_DIR, exist_ok=True)
 
+
 # ============================================================
 # HOSPITAL API CONFIGURATION
 # ============================================================
 
-import os
-HOSPITAL_API_URL = os.getenv("HOSPITAL_API_URL", "http://127.0.0.1:8001")
+HOSPITAL_API_URL = os.getenv(
+    "HOSPITAL_API_URL",
+    "http://127.0.0.1:8001"
+)
 HOSPITAL_RECEIVE_URL = f"{HOSPITAL_API_URL}/receive-event"
 HOSPITAL_TIMEOUT_SECONDS = 10
+
+
 # ============================================================
 # INITIALIZE LEDGER
 # ============================================================
@@ -106,7 +112,6 @@ def health():
 @app.post("/predict")
 def predict(request: VitalSignsRequest):
 
-    # Validate input
     if not request.sequence:
         raise HTTPException(
             status_code=400,
@@ -119,16 +124,18 @@ def predict(request: VitalSignsRequest):
             detail="Each reading must contain exactly 6 vital signs.",
         )
 
-    # Verify ledger before processing
     if not ledger.verify_chain():
         raise HTTPException(
             status_code=500,
             detail="Ledger integrity verification failed.",
         )
 
-    # Predict patient risk
+    # Load the prediction model only when prediction is requested.
     try:
+        from predict import predict_risk
+
         result = predict_risk(request.sequence)
+
     except Exception as exc:
         print("PREDICTION ERROR:", repr(exc))
         raise HTTPException(
@@ -139,10 +146,8 @@ def predict(request: VitalSignsRequest):
     # Generate a fresh AES-256 key
     key = generate_key()
 
-    # Generate unique event ID
     event_id = f"EVENT-{uuid.uuid4().hex}"
 
-    # Create patient event
     event = {
         "event_id": event_id,
         "patient_id": "P001",
@@ -159,10 +164,8 @@ def predict(request: VitalSignsRequest):
         "model_version": "BiLSTM-Attention-v1",
     }
 
-    # Serialize event
     event_json = json.dumps(event)
 
-    # Encrypt event using AES-256-GCM
     nonce, ciphertext = encrypt_data(event_json, key)
 
     # Wrap AES key using hospital RSA public key
@@ -172,13 +175,12 @@ def predict(request: VitalSignsRequest):
         print("KEY WRAPPING ERROR:", repr(exc))
         raise HTTPException(
             status_code=500,
-            detail="Failed to wrap the AES key. Check hospital_public.pem.",
+            detail="Failed to wrap the AES key. Check hospital public key configuration.",
         ) from exc
 
-    # Calculate SHA-256 of nonce + ciphertext
     ciphertext_hash = calculate_sha256(nonce, ciphertext)
 
-    # Sign nonce + ciphertext using ambulance signing key
+    # Sign encrypted event
     try:
         signature_bytes = sign_event(nonce + ciphertext)
         signature = base64.b64encode(
@@ -191,7 +193,6 @@ def predict(request: VitalSignsRequest):
             detail="Failed to sign the encrypted event.",
         ) from exc
 
-    # Prepare encrypted event
     encrypted_event_path = os.path.join(
         ENCRYPTED_EVENTS_DIR,
         f"{event_id}.json",
@@ -211,7 +212,6 @@ def predict(request: VitalSignsRequest):
         "signature": signature,
     }
 
-    # Save event without overwriting an existing file
     try:
         with open(
             encrypted_event_path,
@@ -221,6 +221,7 @@ def predict(request: VitalSignsRequest):
             json.dump(encrypted_event, file, indent=4)
             file.flush()
             os.fsync(file.fileno())
+
     except OSError as exc:
         print("EVENT SAVE ERROR:", repr(exc))
         raise HTTPException(
@@ -236,8 +237,10 @@ def predict(request: VitalSignsRequest):
             model_version=event["model_version"],
             ciphertext_sha256=ciphertext_hash,
         )
+
     except Exception as exc:
         print("LEDGER ERROR:", repr(exc))
+
         try:
             if os.path.exists(encrypted_event_path):
                 os.remove(encrypted_event_path)
@@ -249,7 +252,6 @@ def predict(request: VitalSignsRequest):
             detail="Failed to append the event to the ledger.",
         ) from exc
 
-    # Verify ledger after insertion
     ledger_valid = ledger.verify_chain()
 
     if not ledger_valid:
@@ -258,7 +260,7 @@ def predict(request: VitalSignsRequest):
             detail="Ledger verification failed after event insertion.",
         )
 
-    # Generate and verify a fresh checkpoint.
+    # Generate and verify checkpoint
     try:
         sign_checkpoint()
 
@@ -275,13 +277,11 @@ def predict(request: VitalSignsRequest):
             ),
         ) from exc
 
-    # Send the encrypted event and verification data to the hospital.
+    # Deliver encrypted event to hospital
     try:
-        # Load the latest signed checkpoint.
         with open(CHECKPOINT_PATH, "r", encoding="utf-8") as file:
             checkpoint = json.load(file)
 
-        # Include the ledger and checkpoint with the encrypted event.
         hospital_payload = {
             **encrypted_event,
             "ledger_blocks": ledger.chain,
@@ -293,6 +293,7 @@ def predict(request: VitalSignsRequest):
             json=hospital_payload,
             timeout=HOSPITAL_TIMEOUT_SECONDS,
         )
+
         response.raise_for_status()
         hospital_result = response.json()
 
@@ -309,7 +310,7 @@ def predict(request: VitalSignsRequest):
                 "event_id": event_id,
             },
         ) from exc
-    # Return the prediction and hospital verification result.
+
     return {
         "event_id": event_id,
         "risk": result["risk"],
@@ -329,9 +330,10 @@ def predict(request: VitalSignsRequest):
         "hospital_response": hospital_result,
     }
 
+
 # ============================================================
 # MAX30102 SENSOR EVENT - SECURE HOSPITAL DELIVERY
-# Does not modify or invoke the existing prediction model.
+# Does not invoke the prediction model.
 # ============================================================
 
 class SensorEventRequest(BaseModel):
@@ -409,7 +411,11 @@ def create_sensor_event(request: SensorEventRequest):
     )
 
     try:
-        with open(encrypted_event_path, "x", encoding="utf-8") as file:
+        with open(
+            encrypted_event_path,
+            "x",
+            encoding="utf-8"
+        ) as file:
             json.dump(encrypted_event, file, indent=4)
             file.flush()
             os.fsync(file.fileno())
@@ -443,8 +449,8 @@ def create_sensor_event(request: SensorEventRequest):
             json=hospital_payload,
             timeout=HOSPITAL_TIMEOUT_SECONDS
         )
-        response.raise_for_status()
 
+        response.raise_for_status()
         hospital_result = response.json()
 
     except Exception as exc:
@@ -473,4 +479,3 @@ def create_sensor_event(request: SensorEventRequest):
         "hospital_delivery": "success",
         "hospital_response": hospital_result
     }
-
