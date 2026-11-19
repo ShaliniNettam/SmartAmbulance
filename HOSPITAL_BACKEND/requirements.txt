@@ -6,3 +6,4 @@ torch==2.2.0
 joblib==1.4.2
 numpy==2.1.2
 pydantic==2.9.2
+certifi==2024.7.4
