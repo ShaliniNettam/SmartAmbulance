@@ -12,8 +12,6 @@ services:
         sync: false
       - key: AMBULANCE_PUBLIC_KEY
         sync: false
-      - key: LEDGER_DIR
-        value: /var/data
 
   - type: web
     name: smart-ambulance-api
@@ -24,8 +22,8 @@ services:
     envVars:
       - key: HOSPITAL_API_URL
         sync: false
-      - key: LEDGER_DIR
-        value: /var/data
+      - key: HOSPITAL_PUBLIC_KEY
+        sync: false
 
   - type: web
     name: smart-ambulance-sensor-receiver
@@ -36,5 +34,3 @@ services:
     envVars:
       - key: AMBULANCE_API_URL
         sync: false
-      - key: LEDGER_DIR
-        value: /var/data

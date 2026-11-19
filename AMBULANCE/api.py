@@ -46,7 +46,8 @@ os.makedirs(ENCRYPTED_EVENTS_DIR, exist_ok=True)
 # HOSPITAL API CONFIGURATION
 # ============================================================
 
-HOSPITAL_API_URL = "http://127.0.0.1:8001"
+import os
+HOSPITAL_API_URL = os.getenv("HOSPITAL_API_URL", "http://127.0.0.1:8001")
 HOSPITAL_RECEIVE_URL = f"{HOSPITAL_API_URL}/receive-event"
 HOSPITAL_TIMEOUT_SECONDS = 10
 # ============================================================

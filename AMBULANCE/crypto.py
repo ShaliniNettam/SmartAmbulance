@@ -154,15 +154,37 @@ def generate_hospital_key_pair():
 # ============================================================
 
 def load_hospital_public_key():
-    with open(HOSPITAL_PUBLIC_KEY_PATH, "rb") as file:
-        public_key = serialization.load_pem_public_key(
-            file.read()
-        )
-
+    """Load the hospital public RSA key.
+    Checks the HOSPITAL_PUBLIC_KEY environment variable first; if set, expects a PEM
+    string (base64‑encoded or raw) and loads it directly. Falls back to the key file.
+    """
+    pem = os.getenv("HOSPITAL_PUBLIC_KEY")
+    if pem:
+        try:
+            public_key = serialization.load_pem_public_key(pem.encode("utf-8"))
+        except Exception as e:
+            raise ValueError("Failed to load HOSPITAL_PUBLIC_KEY from env var: " + str(e))
+    else:
+        with open(HOSPITAL_PUBLIC_KEY_PATH, "rb") as file:
+            public_key = serialization.load_pem_public_key(
+                file.read()
+            )
     if not isinstance(public_key, rsa.RSAPublicKey):
         raise ValueError("Hospital public key is not an RSA key.")
-
     return public_key
+
+def load_hospital_public_key_from_env():
+    """Load hospital public key from HOSPITAL_PUBLIC_KEY env var if set, else fallback to file.
+    Returns RSA public key object."""
+    pem = os.getenv("HOSPITAL_PUBLIC_KEY")
+    if pem:
+        try:
+            return serialization.load_pem_public_key(pem.encode("utf-8"))
+        except Exception as e:
+            raise ValueError("Failed to load HOSPITAL_PUBLIC_KEY from env var: " + str(e))
+    # fallback to file
+    with open(HOSPITAL_PUBLIC_KEY_PATH, "rb") as file:
+        return serialization.load_pem_public_key(file.read())
 
 
 # ============================================================
@@ -173,7 +195,20 @@ def wrap_aes_key(aes_key, public_key=None):
     if public_key is None:
         public_key = load_hospital_public_key()
 
-    return public_key.encrypt(
+    return public_key
+
+def load_hospital_public_key_from_env():
+    """Load hospital public key from HOSPITAL_PUBLIC_KEY env var if set, else fallback to file.
+    Returns RSA public key object."""
+    pem = os.getenv("HOSPITAL_PUBLIC_KEY")
+    if pem:
+        try:
+            return serialization.load_pem_public_key(pem.encode("utf-8"))
+        except Exception as e:
+            raise ValueError("Failed to load HOSPITAL_PUBLIC_KEY from env var: " + str(e))
+    # fallback to file
+    with open(HOSPITAL_PUBLIC_KEY_PATH, "rb") as file:
+        return serialization.load_pem_public_key(file.read()).encrypt(
         aes_key,
         padding.OAEP(
             mgf=padding.MGF1(algorithm=hashes.SHA256()),
